@@ -1,4 +1,5 @@
 name: Fly auto-update sub2api
+# workflow registration bump
 
 on:
   schedule:
