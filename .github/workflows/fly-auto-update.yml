@@ -1,20 +1,16 @@
-name: Fly auto-update sub2api
-# workflow registration bump
+name: Fly auto-update
 
 on:
   schedule:
-    # 每天 23:20 UTC ≈ 次日 06:20 泰国/中国时区
+    # 23:20 UTC ≈ 次日 06:20 Asia/Bangkok
     - cron: "20 23 * * *"
   workflow_dispatch:
     inputs:
       force:
-        description: "Force deploy even if digest unchanged"
+        description: Force deploy even if digest unchanged
         required: false
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
+        default: false
+        type: boolean
 
 concurrency:
   group: fly-auto-update-sub2api
@@ -23,18 +19,18 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  APP: sub2api-wkwcpg
-  IMAGE_REPO: weishaw/sub2api
-  IMAGE_TAG: latest
-  PLATFORM_OS: linux
-  PLATFORM_ARCH: amd64
-  FLY_TOML: deploy/fly/fly.toml
-
 jobs:
   auto-update:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      APP: sub2api-wkwcpg
+      IMAGE_REPO: weishaw/sub2api
+      IMAGE_TAG: latest
+      PLATFORM_OS: linux
+      PLATFORM_ARCH: amd64
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      FORCE_DEPLOY: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,162 +38,5 @@ jobs:
       - name: Setup flyctl
         uses: superfly/flyctl-actions/setup-flyctl@master
 
-      - name: Resolve digests
-        id: digests
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          current="$(
-            flyctl image show -a "$APP" 2>/dev/null | python3 -c 'import sys,re; ms=re.findall(r"sha256:[a-f0-9]{64}", sys.stdin.read()); print(ms[0] if ms else "")' || true
-          )"
-          if [ -z "$current" ]; then
-            current="$(
-              flyctl machines list -a "$APP" -j 2>/dev/null | python3 -c '
-import sys,json
-try:
-  d=json.load(sys.stdin)
-except Exception:
-  print(""); raise SystemExit
-for m in d or []:
-  ref=m.get("image_ref") or {}
-  dig=ref.get("digest") or ""
-  if dig:
-    print(dig); raise SystemExit
-  img=(m.get("config") or {}).get("image") or ""
-  if "@sha256:" in img:
-    print("sha256:"+img.split("@sha256:")[-1]); raise SystemExit
-print("")
-' || true
-            )"
-          fi
-
-          remote="$(
-            IMAGE_REPO="$IMAGE_REPO" IMAGE_TAG="$IMAGE_TAG" PLATFORM_OS="$PLATFORM_OS" PLATFORM_ARCH="$PLATFORM_ARCH" python3 - <<'PY'
-import json, os, urllib.request, sys
-
-repo = os.environ["IMAGE_REPO"]
-tag = os.environ["IMAGE_TAG"]
-want_os = os.environ.get("PLATFORM_OS", "linux")
-want_arch = os.environ.get("PLATFORM_ARCH", "amd64")
-
-def get_token():
-    url = f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repo}:pull"
-    return json.load(urllib.request.urlopen(url, timeout=30))["token"]
-
-def get_manifest(token, reference):
-    req = urllib.request.Request(
-        f"https://registry-1.docker.io/v2/{repo}/manifests/{reference}",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": ",".join([
-                "application/vnd.docker.distribution.manifest.list.v2+json",
-                "application/vnd.oci.image.index.v1+json",
-                "application/vnd.docker.distribution.manifest.v2+json",
-                "application/vnd.oci.image.manifest.v1+json",
-            ]),
-        },
-    )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        digest = (r.headers.get("Docker-Content-Digest") or "").strip()
-        body = r.read()
-        ctype = r.headers.get("Content-Type") or ""
-    return digest, ctype, body
-
-token = get_token()
-top_digest, ctype, body = get_manifest(token, tag)
-data = json.loads(body)
-media = (data.get("mediaType") or ctype or "").lower()
-
-if "manifest.list" in media or "image.index" in media or "manifests" in data:
-    chosen = ""
-    for m in data.get("manifests") or []:
-        p = m.get("platform") or {}
-        if p.get("os") == want_os and p.get("architecture") == want_arch:
-            chosen = m.get("digest") or ""
-            break
-    if not chosen:
-        for m in data.get("manifests") or []:
-            p = m.get("platform") or {}
-            if p.get("os") == want_os:
-                chosen = m.get("digest") or ""
-                break
-    print(chosen or top_digest)
-else:
-    print(top_digest)
-PY
-          )"
-
-          if [ -z "${remote:-}" ]; then
-            echo "::error::failed to fetch remote digest from Docker Hub"
-            exit 2
-          fi
-
-          echo "current=${current:-none}"
-          echo "remote=$remote"
-          echo "current=$current" >> "$GITHUB_OUTPUT"
-          echo "remote=$remote" >> "$GITHUB_OUTPUT"
-
-          force="${{ github.event.inputs.force || 'false' }}"
-          if [ "$force" = "true" ]; then
-            echo "need_deploy=true" >> "$GITHUB_OUTPUT"
-            echo "reason=forced"
-          elif [ -n "$current" ] && [ "$current" = "$remote" ]; then
-            echo "need_deploy=false" >> "$GITHUB_OUTPUT"
-            echo "reason=up-to-date"
-          else
-            echo "need_deploy=true" >> "$GITHUB_OUTPUT"
-            echo "reason=digest-changed"
-          fi
-
-      - name: Skip when up-to-date
-        if: steps.digests.outputs.need_deploy != 'true'
-        run: |
-          echo "up-to-date: ${{ steps.digests.outputs.current }} == ${{ steps.digests.outputs.remote }}"
-          echo "No deploy needed."
-
-      - name: Deploy image to Fly
-        if: steps.digests.outputs.need_deploy == 'true'
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: |
-          set -euo pipefail
-          echo "Deploying ${IMAGE_REPO}:${IMAGE_TAG}"
-          echo "from ${{ steps.digests.outputs.current }} -> ${{ steps.digests.outputs.remote }}"
-          flyctl deploy \
-            -a "$APP" \
-            --config "$FLY_TOML" \
-            --image "${IMAGE_REPO}:${IMAGE_TAG}" \
-            --remote-only \
-            --yes
-
-      - name: Health check
-        if: steps.digests.outputs.need_deploy == 'true'
-        run: |
-          set -euo pipefail
-          ok=0
-          code=000
-          for i in $(seq 1 12); do
-            code="$(curl -s -o /tmp/health_body -w '%{http_code}' -m 15 "https://${APP}.fly.dev/health" || echo 000)"
-            echo "attempt $i: HTTP $code"
-            if [ "$code" = "200" ]; then
-              ok=1
-              cat /tmp/health_body || true
-              break
-            fi
-            sleep 5
-          done
-          if [ "$ok" -ne 1 ]; then
-            echo "::error::deploy finished but /health not 200 (last=$code)"
-            exit 3
-          fi
-          echo "health=ok"
-
-      - name: Show final image
-        if: steps.digests.outputs.need_deploy == 'true'
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: |
-          flyctl image show -a "$APP" || true
-          flyctl status -a "$APP" || true
+      - name: Check digests and maybe deploy
+        run: bash deploy/fly/auto-update.sh
